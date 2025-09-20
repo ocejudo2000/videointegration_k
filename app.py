@@ -8,9 +8,18 @@ import numpy as np
 import time
 import sys
 from moviepy import VideoFileClip, AudioFileClip
-from pydub import AudioSegment
 import mimetypes
 from typing import List, Optional, Tuple
+from memory_manager import get_memory_manager, ChunkedProcessor
+
+# Try to import pydub, fallback to moviepy-only if it fails
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError as e:
+    st.warning("⚠️ pydub is not available. Using moviepy for audio processing.")
+    PYDUB_AVAILABLE = False
+    AudioSegment = None
 
 # Configuración de la página
 st.set_page_config(
@@ -173,7 +182,7 @@ class AudioProcessor:
     @staticmethod
     def get_audio_duration(audio_path: str) -> float:
         """
-        Get the duration of an audio file in seconds using pydub.
+        Get the duration of an audio file in seconds using pydub or moviepy.
         
         Args:
             audio_path: Path to audio file
@@ -181,22 +190,23 @@ class AudioProcessor:
         Returns:
             Duration in seconds as float
         """
-        try:
-            # Use pydub to load and get duration
-            audio = AudioSegment.from_file(audio_path)
-            duration_seconds = len(audio) / 1000.0  # pydub returns milliseconds
-            return duration_seconds
-            
-        except Exception as e:
-            # Fallback to moviepy if pydub fails
+        # Try pydub first if available
+        if PYDUB_AVAILABLE:
             try:
-                audio_clip = AudioFileClip(audio_path)
-                duration = audio_clip.duration
-                audio_clip.close()
-                return duration
-            except Exception as moviepy_error:
-                raise Exception(f"Failed to get audio duration with both pydub and moviepy. "
-                              f"Pydub error: {str(e)}, MoviePy error: {str(moviepy_error)}")
+                audio = AudioSegment.from_file(audio_path)
+                duration_seconds = len(audio) / 1000.0  # pydub returns milliseconds
+                return duration_seconds
+            except Exception as e:
+                st.warning(f"pydub failed for {audio_path}, falling back to moviepy: {str(e)}")
+        
+        # Fallback to moviepy
+        try:
+            audio_clip = AudioFileClip(audio_path)
+            duration = audio_clip.duration
+            audio_clip.close()
+            return duration
+        except Exception as moviepy_error:
+            raise Exception(f"Failed to get audio duration with moviepy: {str(moviepy_error)}")
     
     @staticmethod
     def needs_looping(audio_duration: float, video_duration: float) -> bool:
@@ -285,36 +295,39 @@ class AudioProcessor:
                 raise Exception(f"Audio file is too short for looping ({original_duration:.2f}s). "
                               f"Please use audio files longer than 1 second.")
             
-            # Use pydub for seamless looping
-            try:
-                # Load original audio
-                audio = AudioSegment.from_file(audio_path)
-                
-                # Calculate how many full loops we need
-                loops_needed = int(target_duration / original_duration)
-                remaining_time = target_duration - (loops_needed * original_duration)
-                
-                # Create looped audio
-                looped_audio = audio * loops_needed
-                
-                # Add partial loop if needed
-                if remaining_time > 0.1:  # Only add if significant time remains
-                    partial_audio = audio[:int(remaining_time * 1000)]  # pydub uses milliseconds
-                    looped_audio += partial_audio
-                
-                # Ensure exact target duration
-                target_ms = int(target_duration * 1000)
-                if len(looped_audio) > target_ms:
-                    looped_audio = looped_audio[:target_ms]
-                
-                # Export looped audio
-                looped_audio.export(output_path, format="mp3", bitrate="192k")
-                
-                return output_path
-                
-            except Exception as pydub_error:
-                # Fallback to FFmpeg for looping
-                return AudioProcessor._loop_audio_with_ffmpeg(audio_path, target_duration, output_path)
+            # Use pydub for seamless looping if available
+            if PYDUB_AVAILABLE:
+                try:
+                    # Load original audio
+                    audio = AudioSegment.from_file(audio_path)
+                    
+                    # Calculate how many full loops we need
+                    loops_needed = int(target_duration / original_duration)
+                    remaining_time = target_duration - (loops_needed * original_duration)
+                    
+                    # Create looped audio
+                    looped_audio = audio * loops_needed
+                    
+                    # Add partial loop if needed
+                    if remaining_time > 0.1:  # Only add if significant time remains
+                        partial_audio = audio[:int(remaining_time * 1000)]  # pydub uses milliseconds
+                        looped_audio += partial_audio
+                    
+                    # Ensure exact target duration
+                    target_ms = int(target_duration * 1000)
+                    if len(looped_audio) > target_ms:
+                        looped_audio = looped_audio[:target_ms]
+                    
+                    # Export looped audio
+                    looped_audio.export(output_path, format="mp3", bitrate="192k")
+                    
+                    return output_path
+                    
+                except Exception as pydub_error:
+                    st.warning(f"pydub looping failed, using FFmpeg: {str(pydub_error)}")
+            
+            # Fallback to FFmpeg for looping
+            return AudioProcessor._loop_audio_with_ffmpeg(audio_path, target_duration, output_path)
                 
         except Exception as e:
             raise Exception(f"Error looping audio to duration: {str(e)}")
@@ -332,14 +345,30 @@ class AudioProcessor:
         Returns:
             Path to trimmed audio file
         """
+        if PYDUB_AVAILABLE:
+            try:
+                audio = AudioSegment.from_file(audio_path)
+                target_ms = int(target_duration * 1000)
+                trimmed_audio = audio[:target_ms]
+                trimmed_audio.export(output_path, format="mp3", bitrate="192k")
+                return output_path
+            except Exception as e:
+                st.warning(f"pydub trimming failed, using FFmpeg: {str(e)}")
+        
+        # Fallback to FFmpeg for trimming
         try:
-            audio = AudioSegment.from_file(audio_path)
-            target_ms = int(target_duration * 1000)
-            trimmed_audio = audio[:target_ms]
-            trimmed_audio.export(output_path, format="mp3", bitrate="192k")
+            cmd = [
+                "ffmpeg",
+                "-i", audio_path,
+                "-t", str(target_duration),
+                "-c", "copy",
+                "-y",
+                output_path
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
             return output_path
         except Exception as e:
-            raise Exception(f"Error trimming audio: {str(e)}")
+            raise Exception(f"Error trimming audio with FFmpeg: {str(e)}")
     
     @staticmethod
     def _loop_audio_with_ffmpeg(audio_path: str, target_duration: float, output_path: str) -> str:
@@ -404,24 +433,27 @@ class AudioProcessor:
             # Calculate fade-out start time
             fade_start_time = max(0, audio_duration - fade_duration)
             
-            try:
-                # Use pydub for fade-out effect
-                audio = AudioSegment.from_file(audio_path)
-                
-                # Apply fade-out effect
-                fade_ms = int(fade_duration * 1000)  # Convert to milliseconds
-                faded_audio = audio.fade_out(fade_ms)
-                
-                # Export with fade-out
-                faded_audio.export(output_path, format="mp3", bitrate="192k")
-                
-                return output_path
-                
-            except Exception as pydub_error:
-                # Fallback to FFmpeg for fade-out
-                return AudioProcessor._apply_fade_out_with_ffmpeg(
-                    audio_path, fade_start_time, fade_duration, output_path
-                )
+            if PYDUB_AVAILABLE:
+                try:
+                    # Use pydub for fade-out effect
+                    audio = AudioSegment.from_file(audio_path)
+                    
+                    # Apply fade-out effect
+                    fade_ms = int(fade_duration * 1000)  # Convert to milliseconds
+                    faded_audio = audio.fade_out(fade_ms)
+                    
+                    # Export with fade-out
+                    faded_audio.export(output_path, format="mp3", bitrate="192k")
+                    
+                    return output_path
+                    
+                except Exception as pydub_error:
+                    st.warning(f"pydub fade-out failed, using FFmpeg: {str(pydub_error)}")
+            
+            # Fallback to FFmpeg for fade-out
+            return AudioProcessor._apply_fade_out_with_ffmpeg(
+                audio_path, fade_start_time, fade_duration, output_path
+            )
                 
         except Exception as e:
             raise Exception(f"Error applying fade-out effect: {str(e)}")
@@ -985,9 +1017,12 @@ def extract_audio(video_path, output_path):
                     f"**Note:** The video is still available for download")
         st.stop()
 
-# Crear directorios temporales
+# Crear directorios temporales con gestión de memoria
+memory_manager = get_memory_manager()
 temp_dir = tempfile.mkdtemp()
 output_dir = tempfile.mkdtemp()
+memory_manager.register_temp_dir(temp_dir)
+memory_manager.register_temp_dir(output_dir)
 
 # Formulario de entrada
 with st.form("video_form"):
@@ -1022,6 +1057,14 @@ with st.form("video_form"):
 
 # Procesamiento cuando se envía el formulario
 if submitted:
+    # Initialize memory manager for this session
+    memory_manager = get_memory_manager()
+    memory_manager.start_memory_monitoring(check_interval=15)
+    
+    # Check initial memory status
+    memory_stats = memory_manager.get_memory_usage()
+    st.info(f"🔧 **Memoria inicial:** {memory_stats['process_memory_mb']:.1f}MB")
+    
     # Validar entradas usando VideoUploadHandler
     validation_errors = []
     
@@ -1086,44 +1129,65 @@ if submitted:
     status_text.text("Processing and normalizing video segments...")
     progress_bar.progress(20)
     
-    normalized_video_paths = []
-    for i, video_path in enumerate(video_paths):
+    # Process videos with memory management
+    def process_single_video(video_info):
+        i, video_path = video_info
+        # Validate video format first
+        if not VideoProcessor.validate_video_format(video_path):
+            raise Exception(f"Video {i+1} validation failed - not a valid MP4 or corrupted")
+        
+        # Normalize video resolution with fallback
         try:
-            # Validate video format first
-            if not VideoProcessor.validate_video_format(video_path):
-                st.error(f"❌ **Video {i+1} Validation Failed**\n\n"
-                        f"The uploaded file is not a valid MP4 or is corrupted.\n\n"
-                        f"**Solutions:**\n"
-                        f"• Re-encode the video using a video converter\n"
-                        f"• Try uploading a different MP4 file\n"
-                        f"• Ensure the file was not corrupted during upload")
-                st.stop()
-            
-            # Normalize video resolution with fallback
-            try:
-                normalized_path = VideoProcessor.normalize_video_resolution(video_path)
-                normalized_video_paths.append(normalized_path)
-            except Exception as norm_error:
-                # Fallback: Use original video if normalization fails
-                st.warning(f"⚠️ **Video {i+1} Normalization Warning**\n\n"
-                          f"Could not normalize resolution, using original video.\n"
-                          f"This may cause inconsistent video quality.\n\n"
-                          f"**Reason:** {str(norm_error)}")
-                normalized_video_paths.append(video_path)
-            
-            # Update progress for each video processed
-            sub_progress = 20 + (i + 1) * (10 / len(video_paths))
-            progress_bar.progress(int(sub_progress))
-            
-        except Exception as e:
-            st.error(f"❌ **Critical Error Processing Video {i+1}**\n\n"
-                    f"**Error:** {str(e)}\n\n"
+            normalized_path = VideoProcessor.normalize_video_resolution(video_path)
+            memory_manager.register_temp_file(normalized_path)
+            return normalized_path
+        except Exception as norm_error:
+            # Fallback: Use original video if normalization fails
+            st.warning(f"⚠️ **Video {i+1} Normalization Warning**\n\n"
+                      f"Could not normalize resolution, using original video.\n"
+                      f"This may cause inconsistent video quality.\n\n"
+                      f"**Reason:** {str(norm_error)}")
+            return video_path
+    
+    try:
+        # Process videos in chunks to manage memory
+        video_info_list = [(i, path) for i, path in enumerate(video_paths)]
+        normalized_video_paths = ChunkedProcessor.process_files_in_chunks(
+            file_paths=video_info_list,
+            processor_func=process_single_video,
+            chunk_size=2,  # Process 2 videos at a time
+            memory_manager=memory_manager
+        )
+        
+        # Check for any failed processing
+        if None in normalized_video_paths:
+            failed_indices = [i for i, path in enumerate(normalized_video_paths) if path is None]
+            st.error(f"❌ **Video Processing Failed**\n\n"
+                    f"Failed to process videos: {[i+1 for i in failed_indices]}\n\n"
                     f"**Solutions:**\n"
-                    f"• Check that the video file is not corrupted\n"
+                    f"• Check that the video files are not corrupted\n"
                     f"• Ensure you have sufficient disk space\n"
-                    f"• Try with a smaller video file\n"
-                    f"• Re-upload the video file")
+                    f"• Try with smaller video files")
             st.stop()
+        
+        # Update progress
+        progress_bar.progress(30)
+        
+        # Check memory usage after video processing
+        memory_stats = memory_manager.get_memory_usage()
+        if memory_stats['process_memory_mb'] > 600:  # Warning threshold
+            st.warning(f"⚠️ **Alta utilización de memoria:** {memory_stats['process_memory_mb']:.1f}MB")
+            memory_manager.cleanup_temp_files()
+        
+    except Exception as e:
+        st.error(f"❌ **Critical Error Processing Videos**\n\n"
+                f"**Error:** {str(e)}\n\n"
+                f"**Solutions:**\n"
+                f"• Check that video files are not corrupted\n"
+                f"• Ensure sufficient disk space\n"
+                f"• Try with smaller video files\n"
+                f"• Re-upload the video files")
+        st.stop()
     
     # Calculate total video duration for audio processing
     status_text.text("Calculating video durations...")
@@ -1155,11 +1219,11 @@ if submitted:
                 f"• Contact support if the problem persists")
         st.stop()
     
-    # Prepare background music for full video duration
+    # Prepare background music for full video duration with memory management
     status_text.text("Preparing background music for full video duration...")
     progress_bar.progress(35)
     
-    try:
+    def process_audio_with_memory_limit():
         # Analyze audio requirements and process accordingly
         audio_analysis = AudioProcessor.analyze_audio_video_duration(music_path, total_video_duration)
         
@@ -1176,16 +1240,31 @@ if submitted:
         
         # Process audio with looping and fade-out with fallback strategies
         processed_audio_path = os.path.join(temp_dir, "processed_music.mp3")
+        memory_manager.register_temp_file(processed_audio_path)
         
         try:
             AudioProcessor.process_audio_for_video(music_path, total_video_duration, processed_audio_path)
+            return processed_audio_path
         except Exception as audio_proc_error:
             # Fallback: Use original audio if processing fails
             st.warning(f"⚠️ **Audio Processing Warning**\n\n"
                       f"Advanced audio processing failed, using original music.\n"
                       f"The video will still be created but without looping/fade effects.\n\n"
                       f"**Reason:** {str(audio_proc_error)}")
-            processed_audio_path = music_path
+            return music_path
+    
+    try:
+        # Process audio with memory monitoring
+        processed_audio_path = ChunkedProcessor.process_with_memory_limit(
+            operation=process_audio_with_memory_limit,
+            memory_limit_mb=700,
+            memory_manager=memory_manager,
+            max_retries=2
+        )
+        
+        # Check memory after audio processing
+        memory_stats = memory_manager.get_memory_usage()
+        st.info(f"🎵 **Audio procesado:** {memory_stats['process_memory_mb']:.1f}MB utilizados")
         
     except Exception as e:
         st.error(f"❌ **Audio Analysis Failed**\n\n"
@@ -1427,9 +1506,17 @@ if submitted:
         mime="audio/mp3"
     )
     
-    # Limpiar directorios temporales
+    # Limpiar directorios temporales con gestión de memoria
     try:
-        shutil.rmtree(temp_dir)
-        shutil.rmtree(output_dir)
-    except:
-        pass
+        cleanup_result = memory_manager.force_memory_cleanup()
+        st.info(f"🧹 **Limpieza completada:** {cleanup_result['files_cleaned']} archivos, "
+                f"{cleanup_result['memory_freed_mb']:.1f}MB liberados")
+        memory_manager.stop_memory_monitoring()
+    except Exception as cleanup_error:
+        st.warning(f"⚠️ Advertencia durante la limpieza: {cleanup_error}")
+        # Fallback cleanup
+        try:
+            shutil.rmtree(temp_dir)
+            shutil.rmtree(output_dir)
+        except:
+            pass
